@@ -9,6 +9,15 @@ namespace Pinetime {
   }
 
   namespace Components {
+    /** Total bytes read through LVGL's 'F:' filesystem driver since boot.
+     *
+     * Debug instrumentation. LVGL streams file-backed images from flash a line at a time while
+     * rendering, so this counter rises whenever an image is (re)drawn. A screen that expects an
+     * opaque object to cover an image can watch this to confirm the image really is being skipped:
+     * a covered image contributes zero bytes per refresh.
+     */
+    extern uint32_t lvglFsBytesRead;
+
     class LittleVgl {
     public:
       enum class FullRefreshDirections { None, Up, Down, Left, Right, LeftAnim, RightAnim };

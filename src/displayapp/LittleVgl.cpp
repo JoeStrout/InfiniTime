@@ -9,6 +9,8 @@
 
 using namespace Pinetime::Components;
 
+uint32_t Pinetime::Components::lvglFsBytesRead = 0;
+
 namespace {
   void InitTheme() {
     lv_theme_t* theme = lv_pinetime_theme_init();
@@ -42,6 +44,7 @@ namespace {
     lfs_file_t* file = static_cast<lfs_file_t*>(file_p);
     filesys->FileRead(file, static_cast<uint8_t*>(buf), btr);
     *br = btr;
+    lvglFsBytesRead += btr;
     return LV_FS_RES_OK;
   }
 
