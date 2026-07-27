@@ -33,6 +33,9 @@ Services used, all served by the running firmware (no bootloader mode needed):
     0x180a             Device Information         DeviceInformationService.cpp
     0x180f / 0x2a19    Battery level              BatteryInformationService.cpp
 
+The `flash` command needs dfu_bleak.py and unpacker.py from bootloader/ota-dfu-python/,
+which it imports on demand; every other command depends on nothing outside this file.
+
 Firmware quirks this works around -- all verified in the source, and all of them produce
 misleading errors in other clients:
 
@@ -68,11 +71,13 @@ try:
 except ImportError:
     sys.exit("bleak is not installed. Run: pip install bleak")
 
-# Reused rather than reimplemented: same directory, same protocol, already verified
-# against DfuService.cpp. LegacyDfu takes an existing BleakClient, so `flash` runs on
-# the connection this shell already holds.
-from dfu_bleak import DfuError, LegacyDfu
-from unpacker import Unpacker
+# `flash` reuses dfu_bleak.py rather than reimplementing legacy DFU, but that script
+# lives with the vendored OTA DFU tools, which are a fork of another project and carry
+# their own Apache-2.0 licence. It is imported lazily, inside cmd_flash, so that
+# everything else here stays independent of that directory.
+DFU_TOOLS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "bootloader", "ota-dfu-python"
+)
 
 
 UUID_VERSION = "adaf0100-4669-6c65-5472-616e73666572"
@@ -538,8 +543,6 @@ class Shell:
                 return False
         except FsError as exc:
             print(f"error: {exc}")
-        except DfuError as exc:
-            print(f"flash failed: {exc}")
         except OSError as exc:
             print(f"local error: {exc}")
         return True
@@ -703,6 +706,19 @@ class Shell:
         if not os.path.isfile(path):
             raise FsError(f"no such file: {path}")
 
+        # See DFU_TOOLS_DIR: the DFU implementation lives with the vendored tools, and
+        # is pulled in only here, only when a flash is actually requested.
+        if DFU_TOOLS_DIR not in sys.path:
+            sys.path.insert(0, DFU_TOOLS_DIR)
+        try:
+            from dfu_bleak import DfuError, LegacyDfu
+            from unpacker import Unpacker
+        except ImportError as exc:
+            raise FsError(
+                f"could not load the DFU tools from {DFU_TOOLS_DIR}: {exc}. "
+                "flash needs dfu_bleak.py and unpacker.py from that directory."
+            )
+
         unpacker = Unpacker()
         try:
             binfile, datfile = unpacker.unpack_zipfile(path)
@@ -728,6 +744,8 @@ class Shell:
             dfu = LegacyDfu(self.fs.client, DFU_CHUNK_SIZE, DFU_PRN_INTERVAL,
                             DFU_TIMEOUT, self.fs.verbose)
             await dfu.run(firmware, init_packet)
+        except DfuError as exc:
+            raise FsError(f"flash failed: {exc}")
         finally:
             unpacker.delete()
 
@@ -826,7 +844,7 @@ def main():
 
     try:
         asyncio.run(main_async(args))
-    except (FsError, DfuError) as exc:
+    except FsError as exc:
         sys.exit(f"Error: {exc}")
     except KeyboardInterrupt:
         sys.exit("\nInterrupted.")
