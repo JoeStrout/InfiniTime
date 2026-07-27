@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Interactive shell for InfiniTime's BLE filesystem, over bleak.
+One-stop management shell for an InfiniTime watch, over bleak.
 
-Runs anywhere bleak does: CoreBluetooth on macOS, BlueZ on Linux, WinRT on Windows.
+Files, clock and firmware, in one connection. Runs anywhere bleak does: CoreBluetooth
+on macOS, BlueZ on Linux, WinRT on Windows.
 
-    $ ./blefs_shell.py
+    $ ./infinitool.py
     Found InfiniTime (C3764D0D-...)
-    BLE FS version 4
-    blefs> ls /images
-    blefs> cp !fuji.bin /images/fuji.bin
-    blefs> rm /infinitime-resources-1.16.0.zip
-    blefs> exit
+    InfiniTime 1.16.0  |  BLE FS v4  |  battery 87%
+    infinitool> ls /images
+    infinitool> cp !fuji.bin /images/fuji.bin
+    infinitool> time set
+    infinitool> flash !../../build/output/pinetime-mcuboot-app-dfu-1.16.0.zip
+    infinitool> exit
+
+Any command can be run non-interactively with -c, which is repeatable:
+
+    ./infinitool.py -c "cp !fuji.bin /images/fuji.bin" -c "ls /images"
 
 Plain paths refer to the remote (device) filesystem. A local path is prefixed with
 `!`, as in ftp/sftp where `!` escapes to the local machine:
@@ -19,7 +25,13 @@ Plain paths refer to the remote (device) filesystem. A local path is prefixed wi
     cp /fonts/teko.bin !teko.bin         download
     cp !big.bin /images/                 trailing slash keeps the local basename
 
-Protocol: doc/BLEFS.md, cross-checked against src/components/ble/FSService.h/.cpp.
+Services used, all served by the running firmware (no bootloader mode needed):
+
+    adaf0100/adaf0200  InfiniTime file transfer   doc/BLEFS.md, FSService.cpp
+    00001530-...       Nordic legacy DFU          DfuService.cpp (via dfu_bleak.py)
+    0x1805 / 0x2a2b    Current Time Service       CurrentTimeService.cpp
+    0x180a             Device Information         DeviceInformationService.cpp
+    0x180f / 0x2a19    Battery level              BatteryInformationService.cpp
 
 Firmware quirks this works around -- all verified in the source, and all of them produce
 misleading errors in other clients:
@@ -38,10 +50,14 @@ misleading errors in other clients:
     (FSService.cpp:292-296); it is not a file.
   - Everything here is gated behind Settings -> "Firmware & files" on the watch. When it
     is Disabled, every request is refused and the version characteristic reads 0, not 4.
+  - Reading the Current Time characteristic returns 10 bytes, but the firmware fills in
+    only the first 8 (CurrentTimeService.cpp:57-67): dayofweek and reason are left as
+    whatever was on the stack. We parse the date and time and ignore those two fields.
 """
 
 import argparse
 import asyncio
+import datetime
 import os
 import shlex
 import struct
@@ -52,9 +68,39 @@ try:
 except ImportError:
     sys.exit("bleak is not installed. Run: pip install bleak")
 
+# Reused rather than reimplemented: same directory, same protocol, already verified
+# against DfuService.cpp. LegacyDfu takes an existing BleakClient, so `flash` runs on
+# the connection this shell already holds.
+from dfu_bleak import DfuError, LegacyDfu
+from unpacker import Unpacker
+
 
 UUID_VERSION = "adaf0100-4669-6c65-5472-616e73666572"
 UUID_TRANSFER = "adaf0200-4669-6c65-5472-616e73666572"
+
+# Standard SIG characteristics, served by DeviceInformationService, CurrentTimeService
+# and BatteryInformationService respectively.
+UUID_CURRENT_TIME = "00002a2b-0000-1000-8000-00805f9b34fb"
+UUID_LOCAL_TIME = "00002a0f-0000-1000-8000-00805f9b34fb"
+UUID_BATTERY_LEVEL = "00002a19-0000-1000-8000-00805f9b34fb"
+UUID_MANUFACTURER = "00002a29-0000-1000-8000-00805f9b34fb"
+UUID_MODEL_NUMBER = "00002a24-0000-1000-8000-00805f9b34fb"
+UUID_SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb"
+UUID_FW_REVISION = "00002a26-0000-1000-8000-00805f9b34fb"
+UUID_HW_REVISION = "00002a27-0000-1000-8000-00805f9b34fb"
+UUID_SW_REVISION = "00002a28-0000-1000-8000-00805f9b34fb"
+
+# CtsCurrentTimeData, CurrentTimeService.h:36-47. Ten bytes, little endian.
+CTS_FORMAT = "<HBBBBBBBB"
+# CtsLocalTimeData, CurrentTimeService.h:49-52. Both fields count quarter hours:
+# DateTimeController.h:132 multiplies their sum by 15 * 60.
+CTS_LOCAL_FORMAT = "<bb"
+QUARTER_HOUR = 15 * 60
+
+# Legacy DFU defaults, matching dfu_bleak.py's own argparse defaults.
+DFU_CHUNK_SIZE = 20
+DFU_PRN_INTERVAL = 10
+DFU_TIMEOUT = 60.0
 
 CMD_READ = 0x10
 CMD_READ_DATA = 0x11
@@ -108,6 +154,15 @@ Paths refer to the remote (device) filesystem unless prefixed with ! (local), as
   rm PATH               delete a file on the watch
   mkdir PATH            create a directory on the watch
   df                    show free space on the watch
+
+  time                  show the watch clock, and its drift from this machine
+  time set              set the watch clock (and time zone) from this machine
+                          date is an alias for time
+  info                  firmware version, battery, clock, filesystem
+  flash FILE            reflash the firmware from a DFU zip, after confirming
+                          flash !pinetime-mcuboot-app-dfu-1.16.0.zip
+                          the watch reboots when it finishes, ending the session
+
   help                  this text
   exit                  quit (Ctrl-D also works)
 """
@@ -340,6 +395,109 @@ class BleFs:
         return free
 
 
+class Device:
+    """Identity, battery and clock: everything served outside the filesystem service."""
+
+    def __init__(self, client):
+        self.client = client
+
+    async def _read_str(self, uuid):
+        """A Device Information string, or None if this build does not expose it."""
+        try:
+            return (await self.client.read_gatt_char(uuid)).decode(errors="replace").strip("\x00")
+        except Exception:
+            return None
+
+    async def battery(self):
+        try:
+            return (await self.client.read_gatt_char(UUID_BATTERY_LEVEL))[0]
+        except Exception:
+            return None
+
+    async def firmware_version(self):
+        return await self._read_str(UUID_FW_REVISION)
+
+    async def identity(self):
+        return {
+            "manufacturer": await self._read_str(UUID_MANUFACTURER),
+            "model": await self._read_str(UUID_MODEL_NUMBER),
+            "serial": await self._read_str(UUID_SERIAL_NUMBER),
+            "firmware": await self._read_str(UUID_FW_REVISION),
+            "hardware": await self._read_str(UUID_HW_REVISION),
+            "software": await self._read_str(UUID_SW_REVISION),
+        }
+
+    async def get_time(self):
+        """The watch's local time. Second resolution, so drift is only good to +/-1s."""
+        raw = await self.client.read_gatt_char(UUID_CURRENT_TIME)
+        if len(raw) < struct.calcsize(CTS_FORMAT):
+            raise FsError(f"short current-time response: {raw.hex()}")
+        # dayofweek and reason are deliberately discarded: the firmware never assigns
+        # them on the read path, so they are uninitialised stack bytes.
+        year, month, day, hour, minute, second, _dow, _frac, _reason = struct.unpack(
+            CTS_FORMAT, raw[:struct.calcsize(CTS_FORMAT)]
+        )
+        try:
+            return datetime.datetime(year, month, day, hour, minute, second)
+        except ValueError as exc:
+            raise FsError(f"watch reported an impossible time ({year}-{month}-{day} "
+                          f"{hour}:{minute}:{second}): {exc}")
+
+    async def get_utc_offset(self):
+        """(timezone, dst) as timedeltas, or (None, None) if the read fails."""
+        try:
+            raw = await self.client.read_gatt_char(UUID_LOCAL_TIME)
+            tz, dst = struct.unpack(CTS_LOCAL_FORMAT, raw[:2])
+        except Exception:
+            return None, None
+        return (datetime.timedelta(seconds=tz * QUARTER_HOUR),
+                datetime.timedelta(seconds=dst * QUARTER_HOUR))
+
+    async def set_time(self, when=None):
+        """Set the clock from this machine. Writes the zone first, then the time."""
+        when = when or datetime.datetime.now()
+
+        # The whole UTC offset goes in the timezone field and dst is left at 0. Two
+        # reasons: a naive datetime's astimezone() yields a fixed-offset tzinfo whose
+        # dst() is always None, so the DST hour cannot be recovered here anyway; and
+        # nothing in the firmware reads the two fields apart -- DateTimeController.h:94
+        # and :132 only ever use tzOffset + dstOffset.
+        total = when.astimezone().utcoffset() or datetime.timedelta(0)
+        quarters = round(total.total_seconds() / QUARTER_HOUR)
+        try:
+            await self.client.write_gatt_char(
+                UUID_LOCAL_TIME,
+                struct.pack(CTS_LOCAL_FORMAT, quarters, 0),
+                response=True,
+            )
+        except Exception as exc:
+            print(f"  note: could not set the time zone ({exc}); setting the clock anyway")
+
+        # isoweekday() is 1=Monday..7=Sunday, which is what the CTS field wants.
+        await self.client.write_gatt_char(
+            UUID_CURRENT_TIME,
+            struct.pack(CTS_FORMAT, when.year, when.month, when.day, when.hour,
+                        when.minute, when.second, when.isoweekday(), 0, 0),
+            response=True,
+        )
+        return when
+
+
+def describe_drift(watch_time, local_time=None):
+    """Human-readable clock difference, e.g. '3s fast' or 'in sync'."""
+    local_time = local_time or datetime.datetime.now()
+    drift = (watch_time - local_time).total_seconds()
+    if abs(drift) < 1.5:
+        return "in sync with this machine (to the second)"
+    direction = "fast" if drift > 0 else "slow"
+    drift = abs(drift)
+    if drift < 90:
+        return f"{drift:.0f}s {direction}"
+    if drift < 5400:
+        return f"{drift / 60:.1f} min {direction}"
+    return f"{drift / 3600:.1f} h {direction}"
+
+
 def progress(done, total):
     if not total:
         return
@@ -348,8 +506,10 @@ def progress(done, total):
 
 
 class Shell:
-    def __init__(self, fs):
+    def __init__(self, fs, device, assume_yes=False):
         self.fs = fs
+        self.device = device
+        self.assume_yes = assume_yes
 
     async def run_line(self, line):
         try:
@@ -364,6 +524,8 @@ class Shell:
         handlers = {
             "ls": self.cmd_ls, "cp": self.cmd_cp, "rm": self.cmd_rm,
             "mkdir": self.cmd_mkdir, "df": self.cmd_df, "help": self.cmd_help,
+            "time": self.cmd_time, "date": self.cmd_time,
+            "info": self.cmd_info, "flash": self.cmd_flash,
         }
         if command in ("exit", "quit"):
             return False
@@ -371,12 +533,25 @@ class Shell:
             print(f"unknown command {command!r}; try 'help'")
             return True
         try:
-            await handlers[command](args)
+            # A successful flash reboots the watch, which ends the session.
+            if await handlers[command](args) is False:
+                return False
         except FsError as exc:
             print(f"error: {exc}")
+        except DfuError as exc:
+            print(f"flash failed: {exc}")
         except OSError as exc:
             print(f"local error: {exc}")
         return True
+
+    def confirm(self, prompt):
+        if self.assume_yes:
+            return True
+        try:
+            return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            print()
+            return False
 
     async def cmd_help(self, _args):
         print(HELP, end="")
@@ -479,6 +654,89 @@ class Shell:
         free = await self.fs.freespace()
         print(f"{free} bytes free ({free / 1024:.1f} KiB)")
 
+    async def cmd_time(self, args):
+        if args and args[0] == "set":
+            if len(args) > 1:
+                raise FsError("usage: time set  (the clock is always taken from this machine)")
+            when = await self.device.set_time()
+            print(f"watch clock set to {when:%Y-%m-%d %H:%M:%S}")
+            # Read it back: the write is unacknowledged beyond the GATT layer.
+            print(f"watch now reports {await self.device.get_time():%Y-%m-%d %H:%M:%S}")
+            return
+        if args:
+            raise FsError("usage: time [set]")
+
+        watch_time = await self.device.get_time()
+        tz, dst = await self.device.get_utc_offset()
+        print(f"{watch_time:%Y-%m-%d %H:%M:%S}  ({describe_drift(watch_time)})")
+        if tz is not None:
+            total = tz + dst
+            sign = "-" if total < datetime.timedelta(0) else "+"
+            hours, remainder = divmod(abs(total).seconds, 3600)
+            print(f"UTC{sign}{hours:02d}:{remainder // 60:02d}"
+                  f"{f' (includes {dst.seconds // 3600}h DST)' if dst else ''}")
+
+    async def cmd_info(self, _args):
+        ident = await self.device.identity()
+        battery = await self.device.battery()
+
+        print(f"{ident['software'] or 'firmware'} {ident['firmware'] or '?'} "
+              f"on {ident['model'] or 'unknown model'} rev {ident['hardware'] or '?'}"
+              f"  ({ident['manufacturer'] or 'unknown manufacturer'})")
+        if battery is not None:
+            print(f"battery      {battery}%")
+        try:
+            watch_time = await self.device.get_time()
+            print(f"clock        {watch_time:%Y-%m-%d %H:%M:%S}  ({describe_drift(watch_time)})")
+        except FsError as exc:
+            print(f"clock        unavailable: {exc}")
+        print(f"filesystem   BLE FS v{await self.fs.version()}, "
+              f"{await self.fs.freespace()} bytes free")
+        print(f"connection   MTU {self.fs.mtu}: {self.fs.read_chunk} B reads, "
+              f"{self.fs.write_chunk} B writes")
+
+    async def cmd_flash(self, args):
+        if len(args) != 1:
+            raise FsError("usage: flash FILE  (a *-dfu-*.zip package)")
+        # The zip can only ever be local, so the ! prefix is optional here.
+        path = local_path(args[0]) if is_local(args[0]) else os.path.expanduser(args[0])
+        if not os.path.isfile(path):
+            raise FsError(f"no such file: {path}")
+
+        unpacker = Unpacker()
+        try:
+            binfile, datfile = unpacker.unpack_zipfile(path)
+            with open(binfile, "rb") as handle:
+                firmware = handle.read()
+            with open(datfile, "rb") as handle:
+                init_packet = handle.read()
+        except Exception as exc:
+            unpacker.delete()
+            raise FsError(f"could not read DFU package {path}: {exc}")
+
+        current = await self.device.firmware_version()
+        print(f"About to reflash the watch from {os.path.basename(path)}")
+        print(f"  firmware image  {len(firmware)} bytes")
+        print(f"  currently running  {current or 'unknown version'}")
+        print("  the watch will reboot, and this session will end")
+        if not self.confirm("Proceed?"):
+            unpacker.delete()
+            print("Cancelled.")
+            return
+
+        try:
+            dfu = LegacyDfu(self.fs.client, DFU_CHUNK_SIZE, DFU_PRN_INTERVAL,
+                            DFU_TIMEOUT, self.fs.verbose)
+            await dfu.run(firmware, init_packet)
+        finally:
+            unpacker.delete()
+
+        print()
+        print("Done. The watch is rebooting into the new firmware.")
+        print("IMPORTANT: the image is not validated yet. On the watch, swipe right ->")
+        print("cog -> Firmware -> validate, or the next reset will roll it back.")
+        return False  # the connection is gone; end the session
+
 
 async def find_device(name, address, scan_time):
     if address:
@@ -510,28 +768,38 @@ async def main_async(args):
         fs = BleFs(client, args.timeout, args.verbose)
         await fs.start()
 
+        device = Device(client)
+
         version = await fs.version()
         if version == 0:
             raise FsError(
                 "BLE FS version reads 0, which means file access is denied. "
                 "On the watch: Settings -> 'Firmware & files' -> Enabled."
             )
-        print(f"BLE FS version {version}  (MTU {fs.mtu}: "
-              f"{fs.read_chunk} B reads, {fs.write_chunk} B writes)")
 
-        shell = Shell(fs)
+        # One banner line, in the spirit of a login MOTD: what am I talking to?
+        ident = await device.identity()
+        battery = await device.battery()
+        banner = [f"{ident['software'] or 'InfiniTime'} "
+                  f"{ident['firmware'] or '(unknown version)'}", f"BLE FS v{version}"]
+        if battery is not None:
+            banner.append(f"battery {battery}%")
+        print("  |  ".join(banner))
+
+        shell = Shell(fs, device, assume_yes=args.yes)
 
         if args.command:
             for line in args.command:
-                print(f"blefs> {line}")
-                await shell.run_line(line)
+                print(f"infinitool> {line}")
+                if not await shell.run_line(line):
+                    break
             return
 
         print("Type 'help' for commands, 'exit' to quit.")
         loop = asyncio.get_running_loop()
         while True:
             try:
-                line = await loop.run_in_executor(None, input, "blefs> ")
+                line = await loop.run_in_executor(None, input, "infinitool> ")
             except EOFError:
                 print()
                 break
@@ -542,7 +810,8 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive shell for InfiniTime's BLE filesystem.",
+        description="Manage an InfiniTime watch over BLE: files, clock and firmware.",
+        epilog="Run './infinitool.py -c help' for the command list.",
     )
     parser.add_argument("-n", "--name", default="InfiniTime", help="advertised name to match")
     parser.add_argument("-a", "--address", default=None, help="specific address/UUID")
@@ -550,12 +819,14 @@ def main():
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("-c", "--command", action="append",
                         help="run a command and exit; repeatable")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="skip confirmation prompts (needed to 'flash' under -c)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     try:
         asyncio.run(main_async(args))
-    except FsError as exc:
+    except (FsError, DfuError) as exc:
         sys.exit(f"Error: {exc}")
     except KeyboardInterrupt:
         sys.exit("\nInterrupted.")
