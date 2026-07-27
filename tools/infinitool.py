@@ -520,7 +520,7 @@ def progress(done, total):
     if not total:
         return
     filled = int(30 * done / total)
-    print(f"\r  [{'#' * filled}{'-' * (30 - filled)}] {done}/{total} B", end="", flush=True)
+    print(f"\r  [{'#' * filled}{'.' * (30 - filled)}] {done}/{total} B", end="", flush=True)
 
 
 class Shell:
