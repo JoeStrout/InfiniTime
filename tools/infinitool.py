@@ -122,6 +122,11 @@ CMD_LISTDIR_ENTRY = 0x51
 
 STATUS_OK = 0x01
 
+# Claimed size of the write probe that `df` uses to read free space. Must exceed the
+# 4 MB flash so the firmware's min() falls on the real figure, and must stay under
+# INT32_MAX: the firmware stores it in an int (FSService.h:81).
+FREESPACE_PROBE_SIZE = 0x7FFFFFFF
+
 READ_RESPONSE_HEADER = 16       # command, status, pad, chunkoff, totallen, chunklen
 WRITE_RESPONSE_HEADER = 20      # command, status, pad, offset, modTime, freespace
 WRITE_DATA_HEADER = 12          # command, status, pad, offset, dataSize
@@ -386,10 +391,18 @@ class BleFs:
             raise FsError(f"{path}: {describe_status(status)}")
 
     async def freespace(self):
-        """Free bytes, learned from a zero-length write probe to a scratch path."""
+        """Free bytes, learned from a write probe to a scratch path.
+
+        The freespace field is not simply the free space: FSService.cpp:179 returns
+        min(free space, totalSize - offset), i.e. how much of the write just announced
+        the watch can still take. A zero-length probe therefore always answers 0, so the
+        probe has to claim a transfer larger than the flash to see the real figure.
+        The file is opened and closed but never written to, then deleted below.
+        """
         encoded = b"/.blefs_probe"
         await self._send(
-            struct.pack("<BBHIQI", CMD_WRITE, 0, len(encoded), 0, 0, 0) + encoded
+            struct.pack("<BBHIQI", CMD_WRITE, 0, len(encoded), 0, 0, FREESPACE_PROBE_SIZE)
+            + encoded
         )
         data = await self._response()
         _cmd, _status, _pad, _off, _mt, free = struct.unpack_from("<BbHIQI", data, 0)
