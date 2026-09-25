@@ -132,6 +132,31 @@ namespace {
     return token;
   }
 
+  // Expands {frame}, {frame:N} (space padded) or {frame:0N} (zero padded) in an image path template.
+  void FormatFramePath(const char* in, int frame, char* out, size_t size) {
+    size_t len = 0;
+    while (*in != '\0' && len < size - 1) {
+      const char* close = (strncmp(in, "{frame", 6) == 0) ? strchr(in, '}') : nullptr;
+      if (close == nullptr) {
+        out[len++] = *in++;
+        continue;
+      }
+      int width = 1;
+      bool zeroPad = false;
+      if (in[6] == ':') {
+        zeroPad = (in[7] == '0');
+        width = atoi(in + 7);
+      }
+      char number[8];
+      snprintf(number, sizeof(number), zeroPad ? "%0*d" : "%*d", width, frame);
+      for (const char* n = number; *n != '\0' && len < size - 1; n++) {
+        out[len++] = *n;
+      }
+      in = close + 1;
+    }
+    out[len] = '\0';
+  }
+
   bool IsLeapYear(int year) {
     return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
   }
@@ -359,6 +384,7 @@ namespace Pinetime {
           } else if (strcmp(command, "hand") == 0) {
             e.type = ElementType::Hand;
             e.width = 3;
+            e.count = 60; // frames, for image hands
             e.flags |= WatchFaceCanvas::FlagRounded;
             char* which = NextToken(p, quoted);
             int index = (which == nullptr) ? -1 : IndexOf(handNames, which);
@@ -457,6 +483,18 @@ namespace Pinetime {
             ok = ParseInt(value, e.radius);
           } else if (strcmp(key, "inner") == 0) {
             ok = ParseInt(value, e.inner);
+          } else if (strcmp(key, "image") == 0) {
+            // Only the first frame is checked; the rest are assumed to follow the same pattern
+            char path[64];
+            FormatFramePath(value, 0, path, sizeof(path));
+            lfs_info info;
+            if (filesystem.Stat(path, &info) < 0) {
+              return Fail("missing image");
+            }
+            e.str = AddString("F:", value);
+            e.flags |= WatchFaceCanvas::FlagImage;
+          } else if (strcmp(key, "frames") == 0) {
+            ok = ParseInt(value, e.count) && e.count >= 1;
           } else if (strcmp(key, "count") == 0) {
             ok = ParseInt(value, e.count) && e.count >= 2;
           } else if (strcmp(key, "start") == 0 || strcmp(key, "min") == 0) {
@@ -755,7 +793,7 @@ namespace {
     }
   }
 
-  void UpdateHand(WatchFaceCanvas::Element& e, const Values& values) {
+  void UpdateHand(WatchFaceCanvas::Element& e, const Values& values, const char* strings) {
     int32_t angle;
     switch (e.variant) {
       case 0:
@@ -779,6 +817,18 @@ namespace {
     lv_coord_t cx = e.x + e.w / 2;
     lv_coord_t cy = e.y + e.h / 2;
     lv_point_t tip {static_cast<lv_coord_t>(cx + length * sin / trigScale), static_cast<lv_coord_t>(cy - length * cos / trigScale)};
+    if ((e.flags & WatchFaceCanvas::FlagImage) != 0) {
+      // Show the frame nearest the angle, centred on the tip; points[0].x remembers the frame shown
+      int32_t frame = (angle * e.count + 180) / 360 % e.count;
+      if (frame != e.points[0].x) {
+        char path[66];
+        FormatFramePath(&strings[e.str], static_cast<int>(frame), path, sizeof(path));
+        lv_img_set_src(e.obj, path);
+        e.points[0].x = static_cast<lv_coord_t>(frame);
+      }
+      lv_obj_set_pos(e.obj, tip.x - lv_obj_get_width(e.obj) / 2, tip.y - lv_obj_get_height(e.obj) / 2);
+      return;
+    }
     if (tip.x != e.points[1].x || tip.y != e.points[1].y) {
       e.points[0] = {static_cast<lv_coord_t>(cx + start * sin / trigScale), static_cast<lv_coord_t>(cy - start * cos / trigScale)};
       e.points[1] = tip;
@@ -865,8 +915,13 @@ namespace {
         lv_obj_set_style_local_bg_opa(e.obj, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, e.opa);
         lv_obj_set_style_local_border_opa(e.obj, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, e.opa);
         break;
-      case ElementType::Line:
       case ElementType::Hand:
+        if ((e.flags & WatchFaceCanvas::FlagImage) != 0) {
+          lv_obj_set_style_local_image_opa(e.obj, LV_IMG_PART_MAIN, LV_STATE_DEFAULT, e.opa);
+          break;
+        }
+        [[fallthrough]];
+      case ElementType::Line:
       case ElementType::Ticks:
         lv_obj_set_style_local_line_opa(e.obj, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, e.opa);
         break;
@@ -1026,8 +1081,14 @@ void WatchFaceCanvas::CreateObjects() {
         lv_obj_set_style_local_border_width(e.obj, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, (e.type == ElementType::Rect) ? e.width : 0);
         lv_obj_set_style_local_border_color(e.obj, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, e.borderColor);
         break;
-      case ElementType::Line:
       case ElementType::Hand:
+        if ((e.flags & FlagImage) != 0) {
+          e.obj = lv_img_create(lv_scr_act(), nullptr);
+          e.points[0].x = -1;
+          break;
+        }
+        [[fallthrough]];
+      case ElementType::Line:
         e.obj = lv_line_create(lv_scr_act(), nullptr);
         lv_obj_set_style_local_line_width(e.obj, LV_LINE_PART_MAIN, LV_STATE_DEFAULT, e.width);
         lv_obj_set_style_local_line_rounded(e.obj, LV_LINE_PART_MAIN, LV_STATE_DEFAULT, (e.flags & FlagRounded) != 0);
@@ -1209,7 +1270,7 @@ void WatchFaceCanvas::Refresh() {
         break;
       }
       case ElementType::Hand:
-        UpdateHand(e, values);
+        UpdateHand(e, values, strings.data());
         break;
       case ElementType::Bar:
         UpdateBar(e, values);

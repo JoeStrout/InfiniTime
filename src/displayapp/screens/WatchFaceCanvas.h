@@ -75,6 +75,7 @@ namespace Pinetime {
         static constexpr uint8_t MaxConditions = 6;
         static constexpr uint8_t FlagRounded = 1;
         static constexpr uint8_t FlagRecolor = 2;
+        static constexpr uint8_t FlagImage = 4; // hand drawn as a frame image instead of a line
 
         struct Element {
           ElementType type;
