@@ -84,6 +84,14 @@ namespace Pinetime {
       }
 
       /*
+       * returns the tenths of a second (0-9) elapsed since the current second began
+       *
+       * The time is only kept to whole seconds, so this is derived from the RTC
+       * counter. Call CurrentDateTime() first so that the second is up to date.
+       */
+      uint8_t Tenths() const;
+
+      /*
        * returns the offset between local time and UTC in quarters of an hour
        *
        * Availability of this field depends on wether the companion app

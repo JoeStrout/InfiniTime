@@ -1,4 +1,5 @@
 #include "components/datetime/DateTimeController.h"
+#include <algorithm>
 #include <libraries/log/nrf_log.h>
 #include <systemtask/SystemTask.h>
 #include <hal/nrf_rtc.h>
@@ -104,7 +105,8 @@ void DateTime::UpdateTime(uint32_t systickCounter, bool forceUpdate) {
   currentDateTime += std::chrono::seconds(correctedDelta);
   uptime += std::chrono::seconds(correctedDelta);
 
-  std::time_t currentTime = std::chrono::system_clock::to_time_t(currentDateTime);
+  std::time_t currentTime =
+    std::chrono::system_clock::to_time_t(std::chrono::time_point_cast<std::chrono::system_clock::duration>(currentDateTime));
   localTime = *std::localtime(&currentTime);
 
   auto minute = Minutes();
@@ -136,6 +138,17 @@ void DateTime::UpdateTime(uint32_t systickCounter, bool forceUpdate) {
   } else if (hour != 0) {
     isMidnightAlreadyNotified = false;
   }
+}
+
+uint8_t DateTime::Tenths() const {
+  uint32_t systickCounter = nrf_rtc_counter_get(portNRF_RTC_REG);
+  uint32_t systickDelta = 0;
+  if (systickCounter < previousSystickCounter) {
+    systickDelta = static_cast<uint32_t>(portNRF_RTC_MAXTICKS) - previousSystickCounter + systickCounter + 1;
+  } else {
+    systickDelta = systickCounter - previousSystickCounter;
+  }
+  return static_cast<uint8_t>(std::min<uint32_t>(systickDelta * 10 / configTICK_RATE_HZ, 9));
 }
 
 const char* DateTime::MonthShortToString() const {
